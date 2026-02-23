@@ -23,7 +23,7 @@ cursor-proxy
 npx cursor-opencode-auth
 
 # Or clone and run
-git clone https://github.com/R44VC0RP/cursor-opencode-auth
+git clone https://github.com/shabarkin/cursor-opencode-auth
 cd cursor-opencode-auth
 node proxy-server.mjs
 ```
@@ -38,26 +38,26 @@ Add this to your `opencode.json`:
 
 ```json
 {
-  "provider": {
-    "cursor": {
-      "name": "Cursor (Proxy)",
-      "api": "http://localhost:4141/v1",
-      "models": {
-        "composer-1": {
-          "name": "Composer 1",
-          "limit": { "context": 200000, "output": 32000 }
-        },
-        "claude-4.5-sonnet": {
-          "name": "Claude 4.5 Sonnet",
-          "limit": { "context": 200000, "output": 16000 }
-        },
-        "gpt-5.2-codex": {
-          "name": "GPT 5.2 Codex",
-          "limit": { "context": 128000, "output": 16000 }
-        }
-      }
-    }
-  }
+	"provider": {
+		"cursor": {
+			"name": "Cursor (Proxy)",
+			"api": "http://localhost:4141/v1",
+			"models": {
+				"composer-1": {
+					"name": "Composer 1",
+					"limit": { "context": 200000, "output": 32000 }
+				},
+				"claude-4.5-sonnet": {
+					"name": "Claude 4.5 Sonnet",
+					"limit": { "context": 200000, "output": 16000 }
+				},
+				"gpt-5.2-codex": {
+					"name": "GPT 5.2 Codex",
+					"limit": { "context": 128000, "output": 16000 }
+				}
+			}
+		}
+	}
 }
 ```
 
