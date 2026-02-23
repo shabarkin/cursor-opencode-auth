@@ -26,6 +26,7 @@ import {
 import { buildProtobufRequest, createFrame } from './proto.mjs'
 import { extractTextFromResponse } from './response-parser.mjs'
 import { InteractionEventStreamParser } from './interaction-events.mjs'
+import { bridgeNativeToolCallToXml } from './native-tool-bridge.mjs'
 import { buildToolSystemPrompt, buildToolResultContext } from './tools.mjs'
 import { extractImageParts, buildImageContexts } from './image.mjs'
 import { withRetry, parseRetryAfterHeader } from './retry.mjs'
@@ -197,13 +198,15 @@ function createStreamSettler({ onData, onEnd, onError, client }) {
  * Wire up HTTP/2 stream events: response status check, data accumulation
  * with size limit, idle detection, hard timeout, and end/error handling.
  */
-function wireStreamEvents(h2Stream, { settle, settleWithError, setTimers, emitData }, prompt) {
+function wireStreamEvents(h2Stream, { settle, settleWithError, setTimers, emitData }, prompt, tools) {
   const chunks = []
   const eventParser = new InteractionEventStreamParser()
+  const partialArgsByCallId = new Map()
   let totalResponseSize = 0
   let lastDataTime = Date.now()
   let receivedAnyData = false
   let emittedInteractionText = false
+  let emittedNativeToolCall = false
   let sawTurnEnded = false
 
   const getResponseData = () => Buffer.concat(chunks)
@@ -211,21 +214,63 @@ function wireStreamEvents(h2Stream, { settle, settleWithError, setTimers, emitDa
 
   const emitInteractionEvents = (chunk) => {
     const events = eventParser.push(chunk)
+    let shouldShortCircuit = false
 
     for (const event of events) {
       if (event.type === 'text_delta' && event.text.length > 0) {
         emittedInteractionText = true
         emitData(event.text)
+        continue
+      }
+
+      if (event.type === 'partial_tool_call' && typeof event.callId === 'string') {
+        const previous = partialArgsByCallId.get(event.callId) ?? ''
+        partialArgsByCallId.set(event.callId, `${previous}${event.argsTextDelta || ''}`)
+        continue
+      }
+
+      if (event.type === 'tool_call_started' || event.type === 'tool_call_completed') {
+        const argsTextDelta = typeof event.callId === 'string'
+          ? (partialArgsByCallId.get(event.callId) ?? '')
+          : ''
+
+        const bridgedToolCall = bridgeNativeToolCallToXml(event, tools, argsTextDelta)
+        if (bridgedToolCall) {
+          emittedNativeToolCall = true
+          emitData(bridgedToolCall)
+          shouldShortCircuit = true
+        }
+        continue
+      }
+
+      if (event.type === 'interaction_query') {
+        const syntheticCallId = typeof event.callId === 'string' && event.callId.length > 0
+          ? event.callId
+          : `interaction_query_${event.queryId ?? 'unknown'}`
+
+        const bridgedQueryCall = bridgeNativeToolCallToXml(
+          { ...event, callId: syntheticCallId },
+          tools,
+        )
+
+        if (bridgedQueryCall) {
+          emittedNativeToolCall = true
+          emitData(bridgedQueryCall)
+          shouldShortCircuit = true
+        }
+        continue
       }
 
       if (event.type === 'turn_ended') {
         sawTurnEnded = true
       }
     }
+
+    return shouldShortCircuit
   }
 
   const settleFromBufferedState = () => {
-    if (emittedInteractionText || sawTurnEnded) {
+    if (emittedNativeToolCall || emittedInteractionText || sawTurnEnded) {
       settle('')
       return
     }
@@ -252,7 +297,10 @@ function wireStreamEvents(h2Stream, { settle, settleWithError, setTimers, emitDa
     }
 
     chunks.push(chunk)
-    emitInteractionEvents(chunk)
+    const shouldShortCircuit = emitInteractionEvents(chunk)
+    if (shouldShortCircuit) {
+      settle('')
+    }
   })
 
   h2Stream.on('end', () => {
@@ -334,7 +382,7 @@ export function streamChat(model, messages, optionsOrOnData, onEnd, onError) {
     ...buildHeaders(token),
   })
 
-  wireStreamEvents(h2Stream, settler, prompt)
+  wireStreamEvents(h2Stream, settler, prompt, tools)
 
   h2Stream.write(frame)
   h2Stream.end()
