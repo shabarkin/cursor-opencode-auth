@@ -24,7 +24,8 @@ import {
   isAllowedUpstreamHost,
 } from './config.mjs'
 import { buildProtobufRequest, createFrame } from './proto.mjs'
-import { StreamTextExtractor } from './stream-parser.mjs'
+import { extractTextFromResponse } from './response-parser.mjs'
+import { InteractionEventStreamParser } from './interaction-events.mjs'
 import { buildToolSystemPrompt, buildToolResultContext } from './tools.mjs'
 import { extractImageParts, buildImageContexts } from './image.mjs'
 import { withRetry, parseRetryAfterHeader } from './retry.mjs'
@@ -197,14 +198,40 @@ function createStreamSettler({ onData, onEnd, onError, client }) {
  * with size limit, idle detection, hard timeout, and end/error handling.
  */
 function wireStreamEvents(h2Stream, { settle, settleWithError, setTimers, emitData }, prompt) {
-  const textExtractor = new StreamTextExtractor(prompt)
+  const chunks = []
+  const eventParser = new InteractionEventStreamParser()
   let totalResponseSize = 0
   let lastDataTime = Date.now()
   let receivedAnyData = false
+  let emittedInteractionText = false
+  let sawTurnEnded = false
+
+  const getResponseData = () => Buffer.concat(chunks)
+  const getResponseText = () => extractTextFromResponse(getResponseData(), prompt)
+
+  const emitInteractionEvents = (chunk) => {
+    const events = eventParser.push(chunk)
+
+    for (const event of events) {
+      if (event.type === 'text_delta' && event.text.length > 0) {
+        emittedInteractionText = true
+        emitData(event.text)
+      }
+
+      if (event.type === 'turn_ended') {
+        sawTurnEnded = true
+      }
+    }
+  }
 
   const settleFromBufferedState = () => {
-    const trailingDelta = textExtractor.flush()
-    settle(trailingDelta)
+    if (emittedInteractionText || sawTurnEnded) {
+      settle('')
+      return
+    }
+
+    const text = chunks.length > 0 ? getResponseText() : ''
+    settle(text)
   }
 
   h2Stream.on('response', (headers) => {
@@ -224,8 +251,8 @@ function wireStreamEvents(h2Stream, { settle, settleWithError, setTimers, emitDa
       return
     }
 
-    const delta = textExtractor.push(chunk)
-    emitData(delta)
+    chunks.push(chunk)
+    emitInteractionEvents(chunk)
   })
 
   h2Stream.on('end', () => {

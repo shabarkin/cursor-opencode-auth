@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
 import test from 'node:test'
 import { __testables } from '../src/client.mjs'
+import { ProtoWriter, createFrame } from '../src/proto.mjs'
 
 const {
   MAX_RESPONSE_SIZE_BYTES,
@@ -30,6 +31,19 @@ class FakeRequest extends EventEmitter {
   destroy() {
     this.destroyCalls += 1
   }
+}
+
+function createInteractionTextFrame(text) {
+  const textDelta = new ProtoWriter()
+  textDelta.writeString(1, text)
+
+  const interaction = new ProtoWriter()
+  interaction.writeMessage(1, textDelta)
+
+  const serverMessage = new ProtoWriter()
+  serverMessage.writeMessage(1, interaction)
+
+  return createFrame(serverMessage.toBuffer())
 }
 
 test('wireStreamEvents destroys oversized stream and settles once', () => {
@@ -89,6 +103,36 @@ test('wireStreamEvents handles response and stream error race once', () => {
   assert.equal(onErrorCalls, 1)
   assert.equal(onEndCalls, 0)
   assert.equal(closeCalls, 1)
+})
+
+test('wireStreamEvents forwards native interaction text deltas without duplication', () => {
+  const h2Stream = new FakeStream()
+
+  let responseText = ''
+  let onEndCalls = 0
+
+  const settler = createStreamSettler({
+    onData: (text) => {
+      responseText += text
+    },
+    onEnd: () => {
+      onEndCalls += 1
+    },
+    onError: (error) => {
+      throw error
+    },
+    client: { close: () => {} },
+  })
+
+  wireStreamEvents(h2Stream, settler, 'prompt')
+
+  h2Stream.emit('response', { ':status': 200 })
+  h2Stream.emit('data', createInteractionTextFrame('Hello '))
+  h2Stream.emit('data', createInteractionTextFrame('world.'))
+  h2Stream.emit('end')
+
+  assert.equal(onEndCalls, 1)
+  assert.equal(responseText, 'Hello world.')
 })
 
 test('attachConnectRequestHandlers rejects once on oversized response', () => {

@@ -15,6 +15,19 @@ function createTextPayload(text) {
   return writer.toBuffer()
 }
 
+function createInteractionTextFrame(text) {
+  const textDelta = new ProtoWriter()
+  textDelta.writeString(1, text)
+
+  const interaction = new ProtoWriter()
+  interaction.writeMessage(1, textDelta)
+
+  const serverMessage = new ProtoWriter()
+  serverMessage.writeMessage(1, interaction)
+
+  return createFrame(serverMessage.toBuffer())
+}
+
 function createCompressedFrame(payload) {
   const compressed = zlib.gzipSync(payload)
   const frame = Buffer.alloc(5 + compressed.length)
@@ -44,6 +57,7 @@ test('parseFrameStrings ignores trailing incomplete frame bytes', () => {
 test('isFilteredOut removes IDs and user prompt echoes', () => {
   assert.equal(isFilteredOut('123e4567-e89b-12d3-a456-426614174000', '123e4567-e89b-12d3-a456-426614174000', ''), true)
   assert.equal(isFilteredOut('show me weather', 'show me weather', 'show me weather'), true)
+  assert.equal(isFilteredOut('hello there', 'hello there', 'hello'), false)
   assert.equal(isFilteredOut('A useful answer.', 'a useful answer.', ''), false)
 })
 
@@ -59,4 +73,22 @@ test('extractTextFromResponse returns assistant text over user echo', () => {
 
   const output = extractTextFromResponse(Buffer.concat([userFrame, assistantFrame]), 'Explain APIs')
   assert.equal(output, 'APIs define how software components communicate.')
+})
+
+test('extractTextFromResponse strips internal tool IDs from candidates', () => {
+  const noisy = createFrame(createTextPayload('Checking workspace tool_123e4567-e89b-12d3-a456-426614174000 now.'))
+  const clean = createFrame(createTextPayload('Hello. How can I help?'))
+
+  const output = extractTextFromResponse(Buffer.concat([noisy, clean]), 'hello')
+  assert.equal(output.includes('tool_'), false)
+  assert.equal(output.length > 0, true)
+})
+
+test('extractTextFromResponse prefers native interaction text deltas', () => {
+  const fallbackCandidate = createFrame(createTextPayload('Some metadata that should not win.'))
+  const deltaA = createInteractionTextFrame('Native ')
+  const deltaB = createInteractionTextFrame('stream parsing works.')
+
+  const output = extractTextFromResponse(Buffer.concat([fallbackCandidate, deltaA, deltaB]), 'prompt')
+  assert.equal(output, 'Native stream parsing works.')
 })

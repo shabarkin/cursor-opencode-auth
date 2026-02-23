@@ -128,3 +128,28 @@ test('handleChatStream sends error event when required tool call is missing', ()
   const first = JSON.parse(blocks[0])
   assert.match(first.error.message, /required/)
 })
+
+test('handleChatStream emits fallback content for internal progress-only text', () => {
+  const res = new FakeResponse()
+
+  __testables.handleChatStream(
+    res,
+    'composer-1',
+    [{ role: 'user', content: 'test' }],
+    undefined,
+    'auto',
+    (model, messages, options) => {
+      options.onData('Checking the workspace for context.')
+      options.onEnd()
+    }
+  )
+
+  const blocks = parseSseDataBlocks(res.body)
+  const jsonPayloads = blocks
+    .filter(block => block !== '[DONE]')
+    .map(block => JSON.parse(block))
+
+  const contentChunk = jsonPayloads.find(payload => payload.choices[0].delta.content)
+  assert.equal(Boolean(contentChunk), true)
+  assert.match(contentChunk.choices[0].delta.content, /internal tool workflow/)
+})

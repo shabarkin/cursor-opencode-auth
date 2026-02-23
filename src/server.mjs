@@ -33,6 +33,8 @@ const SERVER_REQUEST_TIMEOUT_MS = 120_000
 const SERVER_HEADERS_TIMEOUT_MS = 30_000
 const UNSUPPORTED_CHAT_PARAMS = Object.freeze(['temperature', 'max_tokens', 'top_p'])
 const AUTH_ERROR_RE = /(cursor auth token|CURSOR_AUTH_TOKEN|keychain|secret-tool|get-storedcredential|credentialmanager)/i
+const INTERNAL_PROGRESS_RE = /^(checking|exploring|inspecting|reviewing|looking)\b/i
+const INTERNAL_PROGRESS_FALLBACK = 'I could not complete the request because the upstream model entered an internal tool workflow without a final user response.'
 
 // ---------------------------------------------------------------------------
 // CORS — restricted to localhost origins only
@@ -125,6 +127,22 @@ function isAuthTokenError(error) {
   return Boolean(error && typeof error.message === 'string' && AUTH_ERROR_RE.test(error.message))
 }
 
+function normalizeAssistantContent(text) {
+  const content = typeof text === 'string'
+    ? text.trim().replace(/\s{2,}/g, ' ')
+    : ''
+
+  if (!content) {
+    return null
+  }
+
+  if (INTERNAL_PROGRESS_RE.test(content) && content.length <= 160) {
+    return null
+  }
+
+  return content
+}
+
 // ---------------------------------------------------------------------------
 // Route handlers
 // ---------------------------------------------------------------------------
@@ -195,6 +213,7 @@ function handleChatStream(res, model, messages, tools, toolChoice, streamChatFn 
   const responseId = `chatcmpl-${randomUUID()}`
   const toolCallNames = []
   let hasToolCalls = false
+  let emittedContent = false
 
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
@@ -212,7 +231,12 @@ function handleChatStream(res, model, messages, tools, toolChoice, streamChatFn 
       if (!text) return
       if (hasToolCalls) return
       if (toolChoice === 'required') return
-      writeChunk({ content: text })
+
+      const normalized = normalizeAssistantContent(text)
+      if (!normalized) return
+
+      emittedContent = true
+      writeChunk({ content: normalized })
     },
     onToolCallStart: (index, id, name) => {
       hasToolCalls = true
@@ -264,6 +288,11 @@ function handleChatStream(res, model, messages, tools, toolChoice, streamChatFn 
           })}\n\n`)
           res.end()
           return
+        }
+
+        if (!hasToolCalls && !emittedContent && toolChoice !== 'required') {
+          emittedContent = true
+          writeChunk({ content: INTERNAL_PROGRESS_FALLBACK })
         }
 
         writeChunk({}, hasToolCalls ? 'tool_calls' : 'stop')
@@ -324,7 +353,7 @@ async function handleChatNonStream(res, model, messages, tools, toolChoice, stre
     }
     : {
       role: 'assistant',
-      content: parsed.content || 'No response received',
+      content: normalizeAssistantContent(parsed.content) || INTERNAL_PROGRESS_FALLBACK,
     }
 
   jsonResponse(res, 200, {

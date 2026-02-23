@@ -9,6 +9,10 @@
 
 import zlib from 'zlib'
 import { readVarint, extractStringsFromProtobuf } from './proto.mjs'
+import {
+  parseInteractionEventsFromResponse,
+  extractTextFromInteractionEvents,
+} from './interaction-events.mjs'
 
 // Patterns used to filter out metadata strings
 const METADATA_MARKERS = Object.freeze([
@@ -31,7 +35,19 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const HEX16_RE = /^[0-9a-f]{16}$/i
 const HEX32_RE = /^[0-9a-f]{32}$/i
 const HEX_DASHES_RE = /^[0-9a-f-]{20,}$/i
+const TOOL_ID_RE = /^tool_[0-9a-f-]{20,}$/i
+const TRACE_TOKEN_RE = /^[0-9a-f-]{36}-\d+-[a-z0-9]{3,}$/i
 const MODEL_NAME_RE = /^[A-Z][a-z]+ [A-Z0-9][a-z0-9.-]*$/i
+
+function cleanCandidateText(text) {
+  const withoutToolIds = text.replace(/tool_[0-9a-f-]{20,}/ig, ' ')
+  const lines = withoutToolIds
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter((line) => line.length > 1 && !/^[^\w]{1,3}$/.test(line))
+
+  return lines.join(' ').replace(/\s{2,}/g, ' ').trim()
+}
 
 // ---------------------------------------------------------------------------
 // Frame parsing
@@ -96,7 +112,6 @@ export function isFilteredOut(text, textLower, userPromptLower) {
 
   // Exact user prompt echo
   if (textLower === userPromptLower) return true
-  if (userPromptLower && textLower.includes(userPromptLower)) return true
 
   // Hex IDs
   if (HEX16_RE.test(text)) return true
@@ -105,6 +120,12 @@ export function isFilteredOut(text, textLower, userPromptLower) {
 
   // UUIDs
   if (UUID_RE.test(text)) return true
+
+  // Cursor-internal tool event IDs
+  if (TOOL_ID_RE.test(text)) return true
+
+  // Cursor trace identifiers (request/tool stream IDs)
+  if (TRACE_TOKEN_RE.test(text)) return true
 
   // Metadata
   if (METADATA_MARKERS.some(marker => text.includes(marker))) return true
@@ -185,18 +206,28 @@ export function scoreCandidate(text, textLower, frameIndex, depth, userPromptWor
  * @returns {string} extracted assistant text, or empty string
  */
 export function extractTextFromResponse(data, userPrompt = '') {
-  const allStrings = parseFrameStrings(data)
-
+  const nativeEvents = parseInteractionEventsFromResponse(data)
+  const nativeText = cleanCandidateText(extractTextFromInteractionEvents(nativeEvents))
   const userPromptLower = userPrompt.toLowerCase().trim()
+
+  if (nativeText.length > 0) {
+    const nativeTextLower = nativeText.toLowerCase()
+    if (!isFilteredOut(nativeText, nativeTextLower, userPromptLower)) {
+      return nativeText
+    }
+  }
+
+  const allStrings = parseFrameStrings(data)
   const userPromptWords = userPromptLower.split(/\s+/).filter(w => w.length > 3)
 
   const candidates = allStrings
     .filter(s => {
-      const text = s.text.trim()
+      const rawText = s.text.trim()
+      const text = cleanCandidateText(rawText)
       return !isFilteredOut(text, text.toLowerCase(), userPromptLower)
     })
     .map(s => {
-      const text = s.text.trim()
+      const text = cleanCandidateText(s.text.trim())
       const textLower = text.toLowerCase()
       const score = scoreCandidate(
         text, textLower, s.frameIndex, s.depth,
