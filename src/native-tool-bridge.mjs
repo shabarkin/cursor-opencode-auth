@@ -1,3 +1,5 @@
+import { remapSyntheticContextPath } from './context-file.mjs'
+
 function isObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
 }
@@ -185,7 +187,8 @@ function mapArgumentsForTargetTool(targetToolName, nativeToolName, nativeArgs) {
 
   if (target === 'read') {
     const mapped = {}
-    const filePath = takeString(args.filePath) || takeString(args.path)
+    const rawFilePath = takeString(args.filePath) || takeString(args.path)
+    const filePath = rawFilePath ? remapSyntheticContextPath(rawFilePath) : null
     if (filePath) mapped.filePath = filePath
 
     const offset = takeNumber(args.offset)

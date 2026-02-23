@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { bridgeNativeToolCallToXml } from '../src/native-tool-bridge.mjs'
 import { parseToolCalls } from '../src/tools.mjs'
+import { CONTEXT_FILE_PATH } from '../src/context-file.mjs'
 
 function parseSingleToolCall(xmlText) {
   const parsed = parseToolCalls(xmlText)
@@ -141,4 +142,35 @@ test('bridgeNativeToolCallToXml returns null when no tool mapping exists', () =>
   )
 
   assert.equal(xml, null)
+})
+
+test('bridgeNativeToolCallToXml remaps synthetic /context.txt read path', () => {
+  const tools = [
+    {
+      type: 'function',
+      function: {
+        name: 'read',
+        parameters: {
+          type: 'object',
+          properties: {
+            filePath: { type: 'string' },
+          },
+          required: ['filePath'],
+        },
+      },
+    },
+  ]
+
+  const xml = bridgeNativeToolCallToXml(
+    {
+      callId: 'tool_test_5',
+      toolName: 'read',
+      toolArguments: { filePath: '/context.txt' },
+    },
+    tools,
+  )
+
+  const { call, args } = parseSingleToolCall(xml)
+  assert.equal(call.function.name, 'read')
+  assert.equal(args.filePath, CONTEXT_FILE_PATH)
 })

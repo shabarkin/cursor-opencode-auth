@@ -30,6 +30,7 @@ import { bridgeNativeToolCallToXml } from './native-tool-bridge.mjs'
 import { buildToolSystemPrompt, buildToolResultContext } from './tools.mjs'
 import { extractImageParts, buildImageContexts } from './image.mjs'
 import { withRetry, parseRetryAfterHeader } from './retry.mjs'
+import { CONTEXT_FILE_PATH, persistContextFile } from './context-file.mjs'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -141,8 +142,9 @@ function buildChatPayload(model, messages, options = {}) {
   }
 
   const context = contextParts.join('\n\n')
+  persistContextFile(context)
 
-  const { payload } = buildProtobufRequest(prompt, model, context, imageContexts)
+  const { payload } = buildProtobufRequest(prompt, model, context, imageContexts, CONTEXT_FILE_PATH)
   return { frame: createFrame(payload), prompt }
 }
 

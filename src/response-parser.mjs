@@ -25,6 +25,7 @@ const METADATA_MARKERS = Object.freeze([
   'Composer 1',
   'OpenCode session',
   '/context.txt',
+  'cursor-opencode-context.txt',
 ])
 
 // Max length of a single protobuf string field to consider as a candidate.

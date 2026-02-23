@@ -153,3 +153,197 @@ test('handleChatStream emits fallback content for internal progress-only text', 
   assert.equal(Boolean(contentChunk), true)
   assert.match(contentChunk.choices[0].delta.content, /internal tool workflow/)
 })
+
+test('handleChatStream short-circuits repeated identical tool loop', () => {
+  const res = new FakeResponse()
+
+  const messages = [
+    {
+      role: 'assistant',
+      content: null,
+      tool_calls: [{
+        id: 'call_1',
+        type: 'function',
+        function: {
+          name: 'bash',
+          arguments: '{"command":"which ast-grep"}',
+        },
+      }],
+    },
+    {
+      role: 'tool',
+      tool_call_id: 'call_1',
+      content: '/opt/homebrew/bin/ast-grep',
+    },
+    {
+      role: 'assistant',
+      content: null,
+      tool_calls: [{
+        id: 'call_2',
+        type: 'function',
+        function: {
+          name: 'bash',
+          arguments: '{"command":"which ast-grep"}',
+        },
+      }],
+    },
+    {
+      role: 'tool',
+      tool_call_id: 'call_2',
+      content: '/opt/homebrew/bin/ast-grep',
+    },
+    {
+      role: 'assistant',
+      content: null,
+      tool_calls: [{
+        id: 'call_3',
+        type: 'function',
+        function: {
+          name: 'bash',
+          arguments: '{"command":"which ast-grep"}',
+        },
+      }],
+    },
+    {
+      role: 'tool',
+      tool_call_id: 'call_3',
+      content: '/opt/homebrew/bin/ast-grep',
+    },
+  ]
+
+  __testables.handleChatStream(
+    res,
+    'composer-1',
+    messages,
+    undefined,
+    'auto',
+    () => {
+      throw new Error('streamChat should not be called for looped tool history')
+    },
+  )
+
+  const blocks = parseSseDataBlocks(res.body)
+    .filter(block => block !== '[DONE]')
+    .map(block => JSON.parse(block))
+
+  const contentChunk = blocks.find(payload => payload.choices[0].delta.content)
+  assert.equal(Boolean(contentChunk), true)
+  assert.match(contentChunk.choices[0].delta.content, /ast-grep is available/i)
+})
+
+test('handleChatNonStream short-circuits repeated identical tool loop', async () => {
+  const res = new FakeResponse()
+
+  const messages = [
+    {
+      role: 'assistant',
+      content: null,
+      tool_calls: [{
+        id: 'call_1',
+        type: 'function',
+        function: {
+          name: 'bash',
+          arguments: '{"command":"which ast-grep"}',
+        },
+      }],
+    },
+    {
+      role: 'tool',
+      tool_call_id: 'call_1',
+      content: '/opt/homebrew/bin/ast-grep',
+    },
+    {
+      role: 'assistant',
+      content: null,
+      tool_calls: [{
+        id: 'call_2',
+        type: 'function',
+        function: {
+          name: 'bash',
+          arguments: '{"command":"which ast-grep"}',
+        },
+      }],
+    },
+    {
+      role: 'tool',
+      tool_call_id: 'call_2',
+      content: '/opt/homebrew/bin/ast-grep',
+    },
+    {
+      role: 'assistant',
+      content: null,
+      tool_calls: [{
+        id: 'call_3',
+        type: 'function',
+        function: {
+          name: 'bash',
+          arguments: '{"command":"which ast-grep"}',
+        },
+      }],
+    },
+    {
+      role: 'tool',
+      tool_call_id: 'call_3',
+      content: '/opt/homebrew/bin/ast-grep',
+    },
+  ]
+
+  await __testables.handleChatNonStream(
+    res,
+    'composer-1',
+    messages,
+    undefined,
+    'auto',
+    () => {
+      throw new Error('streamChat should not be called for looped tool history')
+    },
+  )
+
+  const payload = JSON.parse(res.body)
+  assert.equal(payload.choices[0].finish_reason, 'stop')
+  assert.match(payload.choices[0].message.content, /ast-grep is available/i)
+})
+
+test('deriveToolHandling disables tools for short meta prompts', () => {
+  const derived = __testables.deriveToolHandling(
+    [{ role: 'user', content: '"do you have access to ast-grep ?"\n' }],
+    [{ type: 'function', function: { name: 'bash' } }],
+    'auto',
+  )
+
+  assert.equal(derived.toolChoice, 'none')
+  assert.equal(derived.tools, undefined)
+  assert.equal(derived.disabledForMetaPrompt, true)
+})
+
+test('deriveToolHandling preserves tools for explicit action requests', () => {
+  const tools = [{ type: 'function', function: { name: 'bash' } }]
+  const derived = __testables.deriveToolHandling(
+    [{ role: 'user', content: 'can you run ast-grep on src files?' }],
+    tools,
+    'auto',
+  )
+
+  assert.equal(derived.toolChoice, 'auto')
+  assert.equal(derived.tools, tools)
+  assert.equal(derived.disabledForMetaPrompt, false)
+})
+
+test('buildMetaPromptReply returns stable response for ast-grep access prompt', () => {
+  const reply = __testables.buildMetaPromptReply([
+    { role: 'user', content: '"do you have access to ast-grep ?"\n' },
+  ])
+
+  assert.equal(typeof reply, 'string')
+  assert.match(reply, /ast-grep/i)
+  assert.match(reply, /bash/i)
+})
+
+test('buildMetaPromptReply explains short why prompts', () => {
+  const reply = __testables.buildMetaPromptReply([
+    { role: 'user', content: '"why ?"\n' },
+  ])
+
+  assert.equal(typeof reply, 'string')
+  assert.match(reply, /upstream model can get stuck/i)
+})

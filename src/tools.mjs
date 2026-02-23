@@ -203,6 +203,8 @@ export function buildToolSystemPrompt(tools, toolChoice = 'auto') {
     'Do not wrap tool calls in markdown fences.',
     'Do not include extra keys beyond name/arguments in the JSON body.',
     'You may emit multiple <tool_call> blocks when needed.',
+    'If a prior tool_result already answers your need, do not call the same tool again; provide a final user-facing answer.',
+    'Do not call read on /context.txt; conversation context is already provided in-memory.',
     '',
     'Available Tools:',
     definitions,

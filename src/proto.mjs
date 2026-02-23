@@ -166,9 +166,16 @@ export function extractStringsFromProtobuf(buf, fieldPath = '', depth = 0) {
  * @param {string} model   - model identifier (e.g. 'composer-1')
  * @param {string} context - conversation context
  * @param {Array<{path: string, bytes?: Buffer, text?: string}>} imageContexts - image contexts
+ * @param {string} contextPath - synthetic context file path shown to model
  * @returns {{ payload: Buffer, messageId: string, conversationId: string }}
  */
-export function buildProtobufRequest(text, model = 'composer-1', context = '', imageContexts = []) {
+export function buildProtobufRequest(
+  text,
+  model = 'composer-1',
+  context = '',
+  imageContexts = [],
+  contextPath = '/context.txt',
+) {
   const messageId = randomUUID()
   const conversationId = randomUUID()
 
@@ -180,7 +187,7 @@ export function buildProtobufRequest(text, model = 'composer-1', context = '', i
   const explicitCtx = new ProtoWriter()
 
   const baseContext = new ProtoWriter()
-  baseContext.writeString(1, '/context.txt')
+  baseContext.writeString(1, contextPath)
   baseContext.writeString(2, context || 'OpenCode session')
   explicitCtx.writeMessage(2, baseContext)
 
