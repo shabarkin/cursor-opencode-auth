@@ -244,6 +244,50 @@ export function streamChat(model, messages, onData, onEnd, onError) {
 // ---------------------------------------------------------------------------
 
 /**
+ * Attach response handlers for a Connect-RPC request with bounded buffering
+ * and single-settle guard checks.
+ */
+function attachConnectRequestHandlers(req, {
+  cleanup,
+  resolve,
+  reject,
+  isSettled,
+  maxResponseSize,
+}) {
+  const responseChunks = []
+  let responseSize = 0
+
+  req.on('data', (chunk) => {
+    if (isSettled()) return
+    responseSize += chunk.length
+    if (responseSize > maxResponseSize) {
+      req.destroy()
+      cleanup()
+      reject(new Error(`Response exceeded maximum size of ${maxResponseSize} bytes`))
+      return
+    }
+    responseChunks.push(chunk)
+  })
+
+  req.on('end', () => {
+    if (isSettled()) return
+    cleanup()
+    try {
+      const data = Buffer.concat(responseChunks).toString('utf8')
+      resolve(JSON.parse(data))
+    } catch {
+      reject(new Error('Failed to parse Cursor API response'))
+    }
+  })
+
+  req.on('error', (err) => {
+    if (isSettled()) return
+    cleanup()
+    reject(err)
+  })
+}
+
+/**
  * Make a Connect-RPC JSON request to a Cursor API endpoint.
  *
  * @param {string} host    - API hostname
@@ -261,6 +305,7 @@ export async function connectRequest(host, service, method, body = {}) {
   return new Promise((resolve, reject) => {
     const client = http2.connect(`https://${host}`)
     let settled = false
+    const isSettled = () => settled
 
     const cleanup = () => {
       if (settled) return
@@ -275,6 +320,7 @@ export async function connectRequest(host, service, method, body = {}) {
     }, HARD_TIMEOUT_MS)
 
     client.on('error', (err) => {
+      if (isSettled()) return
       cleanup()
       reject(err)
     })
@@ -286,39 +332,22 @@ export async function connectRequest(host, service, method, body = {}) {
       'accept': 'application/json',
     })
 
-    const responseChunks = []
-    let responseSize = 0
-
-    req.on('data', (chunk) => {
-      if (settled) return
-      responseSize += chunk.length
-      if (responseSize > MAX_RESPONSE_SIZE_BYTES) {
-        req.destroy()
-        cleanup()
-        reject(new Error(`Response exceeded maximum size of ${MAX_RESPONSE_SIZE_BYTES} bytes`))
-        return
-      }
-      responseChunks.push(chunk)
-    })
-
-    req.on('end', () => {
-      if (settled) return
-      cleanup()
-      try {
-        const data = Buffer.concat(responseChunks).toString('utf8')
-        resolve(JSON.parse(data))
-      } catch {
-        reject(new Error('Failed to parse Cursor API response'))
-      }
-    })
-
-    req.on('error', (err) => {
-      if (settled) return
-      cleanup()
-      reject(err)
+    attachConnectRequestHandlers(req, {
+      cleanup,
+      resolve,
+      reject,
+      isSettled,
+      maxResponseSize: MAX_RESPONSE_SIZE_BYTES,
     })
 
     req.write(postData)
     req.end()
   })
 }
+
+export const __testables = Object.freeze({
+  MAX_RESPONSE_SIZE_BYTES,
+  createStreamSettler,
+  wireStreamEvents,
+  attachConnectRequestHandlers,
+})
