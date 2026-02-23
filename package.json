@@ -2,7 +2,7 @@
   "name": "cursor-opencode-auth",
   "version": "1.0.0",
   "description": "OpenAI-compatible proxy for Cursor AI models - use Cursor's models (composer-1, claude-4.5-sonnet, gpt-5.2, etc.) in OpenCode or any OpenAI-compatible client",
-  "main": "proxy-server.mjs",
+  "main": "index.mjs",
   "type": "module",
   "bin": {
     "cursor-proxy": "./proxy-server.mjs"
