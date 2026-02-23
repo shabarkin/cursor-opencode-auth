@@ -50,13 +50,31 @@ class RequestError extends Error {
 function setCorsHeaders(req, res) {
   res.setHeader('Vary', 'Origin')
 
-  const origin = req.headers.origin
+  const origin = getRequestOrigin(req)
 
-  if (origin && isAllowedOrigin(origin)) {
+  if (origin !== null && isAllowedOrigin(origin)) {
     res.setHeader('Access-Control-Allow-Origin', origin)
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization')
   }
+}
+
+function getRequestOrigin(req) {
+  const { origin } = req.headers
+  return typeof origin === 'string' ? origin : null
+}
+
+function assertAllowedOrigin(req) {
+  const origin = getRequestOrigin(req)
+  if (origin !== null && !isAllowedOrigin(origin)) {
+    throw new RequestError(403, 'Origin not allowed')
+  }
+  return origin
+}
+
+function isJsonContentType(contentTypeHeader) {
+  if (typeof contentTypeHeader !== 'string') return false
+  return contentTypeHeader.toLowerCase().startsWith('application/json')
 }
 
 // ---------------------------------------------------------------------------
@@ -90,9 +108,13 @@ async function readBody(req) {
  * Extracts only `type` and `text` — strips any extra properties.
  */
 function sanitizeContentPart(part) {
+  if (!part || typeof part !== 'object' || Array.isArray(part)) {
+    return { type: '', text: '' }
+  }
+
   return {
-    type: String(part.type || ''),
-    text: String(part.text || ''),
+    type: typeof part.type === 'string' ? part.type : '',
+    text: typeof part.text === 'string' ? part.text : '',
   }
 }
 
@@ -133,6 +155,24 @@ function validateChatRequest(json) {
         errors.push(`messages[${i}].content is required`)
       } else if (typeof msg.content !== 'string' && !Array.isArray(msg.content)) {
         errors.push(`messages[${i}].content must be a string or array`)
+      } else if (Array.isArray(msg.content)) {
+        for (let j = 0; j < msg.content.length; j++) {
+          const part = msg.content[j]
+          if (!part || typeof part !== 'object' || Array.isArray(part)) {
+            errors.push(`messages[${i}].content[${j}] must be an object`)
+            continue
+          }
+
+          if (typeof part.type !== 'string' || part.type.length === 0) {
+            errors.push(`messages[${i}].content[${j}].type must be a non-empty string`)
+          }
+
+          if (part.type === 'text' && typeof part.text !== 'string') {
+            errors.push(`messages[${i}].content[${j}].text must be a string when type is "text"`)
+          } else if (part.text !== undefined && typeof part.text !== 'string') {
+            errors.push(`messages[${i}].content[${j}].text must be a string when provided`)
+          }
+        }
       }
     }
   }
@@ -284,13 +324,10 @@ async function handleChatNonStream(res, model, messages) {
 export async function handleRequest(req, res) {
   try {
     setCorsHeaders(req, res)
+    const origin = assertAllowedOrigin(req)
 
     if (req.method === 'OPTIONS') {
-      if (!isAllowedOrigin(req.headers.origin)) {
-        res.writeHead(403)
-        res.end()
-        return
-      }
+      if (origin === null) throw new RequestError(403, 'Origin not allowed')
       res.writeHead(204)
       res.end()
       return
@@ -308,6 +345,10 @@ export async function handleRequest(req, res) {
     }
 
     if (path === '/v1/chat/completions' && req.method === 'POST') {
+      if (!isJsonContentType(req.headers['content-type'])) {
+        throw new RequestError(415, 'Content-Type must be application/json')
+      }
+
       const body = await readBody(req)
 
       let json = {}

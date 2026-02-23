@@ -8,7 +8,8 @@
     "cursor-proxy": "./proxy-server.mjs"
   },
   "scripts": {
-    "start": "node proxy-server.mjs"
+    "start": "node proxy-server.mjs",
+    "test": "node --test"
   },
   "keywords": [
     "cursor",
@@ -27,6 +28,6 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/R44VC0RP/cursor-opencode-auth"
+    "url": "https://github.com/shabarkin/cursor-opencode-auth"
   }
 }
