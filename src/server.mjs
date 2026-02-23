@@ -22,6 +22,8 @@ import {
   isAllowedOrigin,
 } from './config.mjs'
 import { streamChat, connectRequest } from './client.mjs'
+import { RequestError, validateChatRequest } from './validation.mjs'
+import { parseToolCalls, ToolCallStreamBuffer } from './tools.mjs'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -29,20 +31,8 @@ import { streamChat, connectRequest } from './client.mjs'
 
 const SERVER_REQUEST_TIMEOUT_MS = 120_000
 const SERVER_HEADERS_TIMEOUT_MS = 30_000
-const MODEL_NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/
-const VALID_ROLES = Object.freeze(['system', 'user', 'assistant', 'tool'])
-
-// ---------------------------------------------------------------------------
-// Custom error class for HTTP error responses
-// ---------------------------------------------------------------------------
-
-class RequestError extends Error {
-  constructor(statusCode, message) {
-    super(message)
-    this.name = 'RequestError'
-    this.statusCode = statusCode
-  }
-}
+const UNSUPPORTED_CHAT_PARAMS = Object.freeze(['temperature', 'max_tokens', 'top_p'])
+const AUTH_ERROR_RE = /(cursor auth token|CURSOR_AUTH_TOKEN|keychain|secret-tool|get-storedcredential|credentialmanager)/i
 
 // ---------------------------------------------------------------------------
 // CORS — restricted to localhost origins only
@@ -101,140 +91,6 @@ async function readBody(req) {
 }
 
 // ---------------------------------------------------------------------------
-// Input validation + message sanitization
-// ---------------------------------------------------------------------------
-
-/**
- * Sanitize a single content part (from OpenAI multi-modal format).
- * Extracts only `type` and `text` — strips any extra properties.
- */
-function sanitizeContentPart(part) {
-  if (!part || typeof part !== 'object' || Array.isArray(part)) {
-    return { type: '', text: '' }
-  }
-
-  return {
-    type: typeof part.type === 'string' ? part.type : '',
-    text: typeof part.text === 'string' ? part.text : '',
-  }
-}
-
-/**
- * Sanitize message content — returns only expected fields,
- * preventing prototype pollution or unexpected property passthrough.
- */
-function sanitizeContent(content) {
-  if (typeof content === 'string') return content
-  if (Array.isArray(content)) return content.map(sanitizeContentPart)
-  return String(content)
-}
-
-/**
- * Validate a single content part within a message content array.
- *
- * @param {*}      part   - the content part to validate
- * @param {string} prefix - error message prefix (e.g. "messages[0].content[1]")
- * @returns {string[]} array of validation error strings
- */
-function validateContentPart(part, prefix) {
-  const errors = []
-
-  if (!part || typeof part !== 'object' || Array.isArray(part)) {
-    errors.push(`${prefix} must be an object`)
-    return errors
-  }
-
-  if (typeof part.type !== 'string' || part.type.length === 0) {
-    errors.push(`${prefix}.type must be a non-empty string`)
-  }
-
-  if (part.type === 'text' && typeof part.text !== 'string') {
-    errors.push(`${prefix}.text must be a string when type is "text"`)
-  } else if (part.text !== undefined && typeof part.text !== 'string') {
-    errors.push(`${prefix}.text must be a string when provided`)
-  }
-
-  return errors
-}
-
-/**
- * Validate a single message object (role + content).
- *
- * @param {*}      msg    - the message to validate
- * @param {number} index  - message index for error context
- * @returns {string[]} array of validation error strings
- */
-function validateMessage(msg, index) {
-  const prefix = `messages[${index}]`
-  const errors = []
-
-  if (!msg || typeof msg !== 'object') {
-    return [`${prefix} must be an object`]
-  }
-
-  if (!VALID_ROLES.includes(msg.role)) {
-    errors.push(`${prefix}.role must be one of: ${VALID_ROLES.join(', ')}`)
-  }
-
-  if (msg.content === undefined || msg.content === null) {
-    errors.push(`${prefix}.content is required`)
-  } else if (typeof msg.content !== 'string' && !Array.isArray(msg.content)) {
-    errors.push(`${prefix}.content must be a string or array`)
-  } else if (Array.isArray(msg.content)) {
-    for (let j = 0; j < msg.content.length; j++) {
-      errors.push(...validateContentPart(msg.content[j], `${prefix}.content[${j}]`))
-    }
-  }
-
-  return errors
-}
-
-/**
- * Validate and sanitize a chat completion request body.
- * Returns a new sanitized object — only expected fields, no raw passthrough.
- *
- * @param {object} json - parsed request body
- * @returns {{ model: string, messages: Array, stream: boolean }}
- * @throws {RequestError} on validation failure
- */
-function validateChatRequest(json) {
-  const errors = []
-
-  if (json.model !== undefined) {
-    if (typeof json.model !== 'string' || !MODEL_NAME_RE.test(json.model)) {
-      errors.push('model must be an alphanumeric string (max 64 chars, e.g. "composer-1")')
-    }
-  }
-
-  if (!Array.isArray(json.messages)) {
-    errors.push('messages must be an array')
-  } else if (json.messages.length === 0) {
-    errors.push('messages must not be empty')
-  } else {
-    for (let i = 0; i < json.messages.length; i++) {
-      errors.push(...validateMessage(json.messages[i], i))
-    }
-  }
-
-  if (json.stream !== undefined && typeof json.stream !== 'boolean') {
-    errors.push('stream must be a boolean')
-  }
-
-  if (errors.length > 0) {
-    throw new RequestError(400, `Invalid request: ${errors.join('; ')}`)
-  }
-
-  return {
-    model: typeof json.model === 'string' ? json.model : 'composer-1',
-    messages: json.messages.map(msg => ({
-      role: msg.role,
-      content: sanitizeContent(msg.content),
-    })),
-    stream: json.stream === true,
-  }
-}
-
-// ---------------------------------------------------------------------------
 // JSON response helpers
 // ---------------------------------------------------------------------------
 
@@ -255,6 +111,18 @@ function errorResponse(res, statusCode, message) {
 
 function sanitizeLogString(str) {
   return str.replace(/[^\x20-\x7e]/g, '')
+}
+
+function logUnsupportedParams(payload) {
+  for (const parameter of UNSUPPORTED_CHAT_PARAMS) {
+    if (payload[parameter] !== undefined) {
+      process.stdout.write(`[WARN] Unsupported chat parameter ignored: ${sanitizeLogString(parameter)}\n`)
+    }
+  }
+}
+
+function isAuthTokenError(error) {
+  return Boolean(error && typeof error.message === 'string' && AUTH_ERROR_RE.test(error.message))
 }
 
 // ---------------------------------------------------------------------------
@@ -280,8 +148,53 @@ async function handleModels(res) {
   jsonResponse(res, 200, { object: 'list', data: models })
 }
 
-function handleChatStream(res, model, messages) {
+function buildSseChunk(responseId, model, delta, finishReason = null) {
+  return {
+    id: responseId,
+    object: 'chat.completion.chunk',
+    created: Math.floor(Date.now() / 1000),
+    model,
+    choices: [{
+      index: 0,
+      delta,
+      finish_reason: finishReason,
+    }],
+  }
+}
+
+function getToolChoiceViolation(toolChoice, toolCallNames) {
+  if (toolChoice === 'required' && toolCallNames.length === 0) {
+    return 'tool_choice is set to "required" but model returned no tool calls'
+  }
+
+  if (toolChoice === 'none' && toolCallNames.length > 0) {
+    return 'tool_choice is set to "none" but model returned tool calls'
+  }
+
+  if (
+    toolChoice &&
+    typeof toolChoice === 'object' &&
+    toolChoice.type === 'function' &&
+    toolChoice.function &&
+    typeof toolChoice.function.name === 'string'
+  ) {
+    if (toolCallNames.length === 0) {
+      return `tool_choice requires function "${toolChoice.function.name}" but model returned no tool calls`
+    }
+
+    const invalid = toolCallNames.find(name => name !== toolChoice.function.name)
+    if (invalid) {
+      return `tool_choice requires function "${toolChoice.function.name}" but model returned "${invalid}"`
+    }
+  }
+
+  return null
+}
+
+function handleChatStream(res, model, messages, tools, toolChoice, streamChatFn = streamChat) {
   const responseId = `chatcmpl-${randomUUID()}`
+  const toolCallNames = []
+  let hasToolCalls = false
 
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
@@ -289,59 +202,130 @@ function handleChatStream(res, model, messages) {
     'Connection': 'keep-alive',
   })
 
-  streamChat(
+  const writeChunk = (delta, finishReason = null) => {
+    const eventData = buildSseChunk(responseId, model, delta, finishReason)
+    res.write(`data: ${JSON.stringify(eventData)}\n\n`)
+  }
+
+  const streamBuffer = new ToolCallStreamBuffer({
+    onContentDelta: (text) => {
+      if (!text) return
+      if (hasToolCalls) return
+      if (toolChoice === 'required') return
+      writeChunk({ content: text })
+    },
+    onToolCallStart: (index, id, name) => {
+      hasToolCalls = true
+      toolCallNames.push(name)
+      writeChunk({
+        tool_calls: [{
+          index,
+          id,
+          type: 'function',
+          function: {
+            name,
+            arguments: '',
+          },
+        }],
+      })
+    },
+    onToolCallArgumentsDelta: (index, argumentsDelta) => {
+      writeChunk({
+        tool_calls: [{
+          index,
+          function: {
+            arguments: argumentsDelta,
+          },
+        }],
+      })
+    },
+  })
+
+  streamChatFn(
     model,
     messages,
-    (text) => {
-      if (text) {
-        const eventData = {
-          id: responseId,
-          object: 'chat.completion.chunk',
-          created: Math.floor(Date.now() / 1000),
-          model,
-          choices: [{
-            index: 0,
-            delta: { content: text },
-            finish_reason: null,
-          }],
+    {
+      tools,
+      toolChoice,
+      onData: (text) => {
+        streamBuffer.push(text)
+      },
+      onEnd: () => {
+        streamBuffer.flush()
+
+        const violation = getToolChoiceViolation(toolChoice, toolCallNames)
+        if (violation) {
+          res.write(`data: ${JSON.stringify({
+            error: {
+              message: violation,
+              type: 'proxy_error',
+              code: 502,
+            },
+          })}\n\n`)
+          res.end()
+          return
         }
-        res.write(`data: ${JSON.stringify(eventData)}\n\n`)
-      }
+
+        writeChunk({}, hasToolCalls ? 'tool_calls' : 'stop')
+        res.write('data: [DONE]\n\n')
+        res.end()
+      },
+      onError: (err) => {
+        process.stderr.write(`Stream error: ${err.message}\n`)
+        const authFailure = isAuthTokenError(err)
+        res.write(`data: ${JSON.stringify({
+          error: {
+            message: authFailure ? err.message : 'Internal proxy error',
+            type: 'proxy_error',
+            code: authFailure ? 401 : 500,
+          },
+        })}\n\n`)
+        res.end()
+      },
     },
-    () => {
-      const doneData = {
-        id: responseId,
-        object: 'chat.completion.chunk',
-        created: Math.floor(Date.now() / 1000),
-        model,
-        choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
-      }
-      res.write(`data: ${JSON.stringify(doneData)}\n\n`)
-      res.write('data: [DONE]\n\n')
-      res.end()
-    },
-    (err) => {
-      process.stderr.write(`Stream error: ${err.message}\n`)
-      res.write(`data: ${JSON.stringify({ error: 'Internal proxy error' })}\n\n`)
-      res.end()
-    }
   )
 }
 
-async function handleChatNonStream(res, model, messages) {
+async function handleChatNonStream(res, model, messages, tools, toolChoice, streamChatFn = streamChat) {
   const chunks = []
 
   await new Promise((resolve, reject) => {
-    streamChat(
+    streamChatFn(
       model,
       messages,
-      (text) => { chunks.push(text) },
-      resolve,
-      reject
+      {
+        tools,
+        toolChoice,
+        onData: (text) => { chunks.push(text) },
+        onEnd: resolve,
+        onError: reject,
+      },
     )
   })
 
   const fullResponse = chunks.join('')
+  const parsed = parseToolCalls(fullResponse)
+  const toolCallNames = parsed.toolCalls.map(call => call.function.name)
+  const violation = getToolChoiceViolation(toolChoice, toolCallNames)
+
+  if (parsed.pendingToolCall) {
+    throw new RequestError(502, 'Upstream response ended with an incomplete tool_call block')
+  }
+
+  if (violation) {
+    throw new RequestError(502, violation)
+  }
+
+  const message = parsed.toolCalls.length > 0
+    ? {
+      role: 'assistant',
+      content: parsed.content.length > 0 ? parsed.content : null,
+      tool_calls: parsed.toolCalls,
+    }
+    : {
+      role: 'assistant',
+      content: parsed.content || 'No response received',
+    }
 
   jsonResponse(res, 200, {
     id: `chatcmpl-${randomUUID()}`,
@@ -350,8 +334,8 @@ async function handleChatNonStream(res, model, messages) {
     model,
     choices: [{
       index: 0,
-      message: { role: 'assistant', content: fullResponse || 'No response received' },
-      finish_reason: 'stop',
+      message,
+      finish_reason: parsed.toolCalls.length > 0 ? 'tool_calls' : 'stop',
     }],
     usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
   })
@@ -400,21 +384,32 @@ export async function handleRequest(req, res) {
         }
       }
 
-      const { model, messages, stream } = validateChatRequest(json)
+      logUnsupportedParams(json)
 
-      process.stdout.write(`  Model: ${sanitizeLogString(model)}, Messages: ${messages.length}, Stream: ${stream}\n`)
+      const { model, messages, stream, tools, toolChoice } = validateChatRequest(json)
+
+      const requestedTools = Array.isArray(tools) ? tools.length : 0
+      process.stdout.write(
+        `  Model: ${sanitizeLogString(model)}, Messages: ${messages.length}, ` +
+        `Stream: ${stream}, Tools: ${requestedTools}, ToolChoice: ${sanitizeLogString(String(toolChoice))}\n`
+      )
 
       if (stream) {
-        return handleChatStream(res, model, messages)
+        return handleChatStream(res, model, messages, tools, toolChoice)
       }
 
-      return await handleChatNonStream(res, model, messages)
+      return await handleChatNonStream(res, model, messages, tools, toolChoice)
     }
 
     throw new RequestError(404, `Unknown endpoint: ${safePath}`)
   } catch (error) {
-    const statusCode = error.statusCode || 500
-    const message = error.statusCode ? error.message : 'Internal server error'
+    const authFailure = isAuthTokenError(error)
+    const statusCode = error.statusCode || (authFailure ? 401 : 500)
+    const message = error.statusCode
+      ? error.message
+      : authFailure
+        ? error.message
+        : 'Internal server error'
 
     if (!error.statusCode) {
       process.stderr.write(`[ERROR] ${error.stack || error.message}\n`)
@@ -436,7 +431,7 @@ function printBanner(port) {
   -----------------------------------
   Listening:  http://127.0.0.1:${port}
   Endpoints:  /v1/models, /v1/chat/completions
-  Token:      Loaded from macOS Keychain (cached 5 min)
+  Token:      Loaded from platform store (cached 5 min)
   CORS:       Restricted to localhost origins
   Bound to:   127.0.0.1 only (not exposed to LAN)
 
@@ -461,3 +456,10 @@ export function createServer(port) {
 
   return server
 }
+
+export const __testables = Object.freeze({
+  buildSseChunk,
+  getToolChoiceViolation,
+  handleChatStream,
+  handleChatNonStream,
+})

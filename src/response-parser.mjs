@@ -44,7 +44,7 @@ const MODEL_NAME_RE = /^[A-Z][a-z]+ [A-Z0-9][a-z0-9.-]*$/i
  * @param {Buffer} data - raw response bytes
  * @returns {Array<{text: string, fieldPath: string, depth: number, frameIndex: number}>}
  */
-function parseFrameStrings(data) {
+export function parseFrameStrings(data) {
   const allStrings = []
   let offset = 0
   let frameIndex = 0
@@ -91,7 +91,7 @@ function parseFrameStrings(data) {
 /**
  * Returns true if the string should be excluded from candidates.
  */
-function isFilteredOut(text, textLower, userPromptLower) {
+export function isFilteredOut(text, textLower, userPromptLower) {
   if (text.length === 0 || text.length > MAX_CANDIDATE_LENGTH) return true
 
   // Exact user prompt echo
@@ -123,7 +123,7 @@ function isFilteredOut(text, textLower, userPromptLower) {
  * Score a candidate string based on how likely it is to be the
  * assistant's actual response text.
  */
-function scoreCandidate(text, textLower, frameIndex, depth, userPromptWords, userPromptLower, userPrompt) {
+export function scoreCandidate(text, textLower, frameIndex, depth, userPromptWords, userPromptLower, userPrompt) {
   let score = 0
 
   // Prefer longer, complete-looking responses

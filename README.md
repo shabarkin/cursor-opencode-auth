@@ -7,8 +7,8 @@ An OpenAI-compatible proxy server that lets you use Cursor's AI models (composer
 ## Requirements
 
 - **Node.js 18+**
-- **macOS** (uses Keychain for token storage)
 - **Cursor CLI** installed and logged in - [Install here](https://cursor.com/cli) (the proxy uses your Cursor auth token)
+- **macOS, Linux, or Windows** (token providers are platform-aware)
 
 ## Quick Start
 
@@ -100,9 +100,18 @@ The proxy exposes all models available in your Cursor subscription:
 - `o4` - O4 reasoning model
 - And more...
 
+## Feature Status
+
+- ✅ OpenAI-compatible chat completions
+- ✅ Tool calling (`tools`, `tool_choice`, streamed `delta.tool_calls`)
+- ✅ Image input parts (`type: "image_url"`) via base64 `data:image/...` URLs
+- ✅ True incremental streaming (progressive deltas)
+- ✅ Cross-platform token loading (env, platform store, file fallback)
+- ✅ Retry logic for transient upstream API failures
+
 ## How It Works
 
-1. The proxy extracts your Cursor auth token from macOS Keychain
+1. The proxy loads your Cursor auth token from `CURSOR_AUTH_TOKEN`, platform credential store, or token file fallback
 2. Incoming OpenAI-format requests are translated to Cursor's Connect-RPC/protobuf format
 3. Requests are sent to Cursor's API (`agentn.api5.cursor.sh`)
 4. Protobuf responses are parsed and converted back to OpenAI format
@@ -119,13 +128,35 @@ DEBUG=1 node proxy-server.mjs
 
 ## Troubleshooting
 
-### "Could not get token from keychain"
+### "Failed to load Cursor auth token"
 
 Make sure you have the [Cursor CLI](https://cursor.com/cli) installed and are logged in. The token is stored at:
 
 ```bash
 security find-generic-password -s "cursor-access-token" -w
 ```
+
+Linux token check:
+
+```bash
+secret-tool lookup service cursor-access-token
+```
+
+Windows token check (PowerShell):
+
+```powershell
+Get-StoredCredential -Target "cursor-access-token"
+```
+
+You can always bypass platform stores by setting:
+
+```bash
+export CURSOR_AUTH_TOKEN="<your-token>"
+```
+
+### Image support notes
+
+`image_url` inputs currently accept **only** base64 `data:image/...` URLs. Remote `http(s)` image URLs are rejected in v1 for safety.
 
 ### Empty responses
 

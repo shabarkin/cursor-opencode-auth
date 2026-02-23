@@ -35,6 +35,13 @@ export class ProtoWriter {
     this.parts.push(buf)
   }
 
+  writeBytes(field, buffer) {
+    const buf = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer)
+    this.writeVarint((field << 3) | 2)
+    this.writeVarint(buf.length)
+    this.parts.push(buf)
+  }
+
   writeMessage(field, writer) {
     const buf = writer.toBuffer()
     this.writeVarint((field << 3) | 2)
@@ -158,9 +165,10 @@ export function extractStringsFromProtobuf(buf, fieldPath = '', depth = 0) {
  * @param {string} text    - user prompt
  * @param {string} model   - model identifier (e.g. 'composer-1')
  * @param {string} context - conversation context
+ * @param {Array<{path: string, bytes?: Buffer, text?: string}>} imageContexts - image contexts
  * @returns {{ payload: Buffer, messageId: string, conversationId: string }}
  */
-export function buildProtobufRequest(text, model = 'composer-1', context = '') {
+export function buildProtobufRequest(text, model = 'composer-1', context = '', imageContexts = []) {
   const messageId = randomUUID()
   const conversationId = randomUUID()
 
@@ -169,12 +177,25 @@ export function buildProtobufRequest(text, model = 'composer-1', context = '') {
   userMsg.writeString(2, messageId)
   userMsg.writeString(3, '')
 
-  const fileCtx = new ProtoWriter()
-  fileCtx.writeString(1, '/context.txt')
-  fileCtx.writeString(2, context || 'OpenCode session')
-
   const explicitCtx = new ProtoWriter()
-  explicitCtx.writeMessage(2, fileCtx)
+
+  const baseContext = new ProtoWriter()
+  baseContext.writeString(1, '/context.txt')
+  baseContext.writeString(2, context || 'OpenCode session')
+  explicitCtx.writeMessage(2, baseContext)
+
+  for (const imageContext of imageContexts) {
+    const fileCtx = new ProtoWriter()
+    fileCtx.writeString(1, imageContext.path)
+
+    if (Buffer.isBuffer(imageContext.bytes)) {
+      fileCtx.writeBytes(2, imageContext.bytes)
+    } else {
+      fileCtx.writeString(2, imageContext.text || '')
+    }
+
+    explicitCtx.writeMessage(2, fileCtx)
+  }
 
   const userMsgAction = new ProtoWriter()
   userMsgAction.writeMessage(1, userMsg)

@@ -24,7 +24,10 @@ import {
   isAllowedUpstreamHost,
 } from './config.mjs'
 import { buildProtobufRequest, createFrame } from './proto.mjs'
-import { extractTextFromResponse } from './response-parser.mjs'
+import { StreamTextExtractor } from './stream-parser.mjs'
+import { buildToolSystemPrompt, buildToolResultContext } from './tools.mjs'
+import { extractImageParts, buildImageContexts } from './image.mjs'
+import { withRetry, parseRetryAfterHeader } from './retry.mjs'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -48,6 +51,37 @@ function extractContentText(content) {
       .join('\n')
   }
   return String(content || '')
+}
+
+function getPromptText(messages) {
+  const lastUserMsg = messages.filter(m => m.role === 'user').pop()
+  if (lastUserMsg) {
+    return extractContentText(lastUserMsg.content)
+  }
+
+  const lastMessage = messages[messages.length - 1]
+  return extractContentText(lastMessage?.content)
+}
+
+function normalizeStreamChatOptions(optionsOrOnData, onEnd, onError) {
+  if (typeof optionsOrOnData === 'function') {
+    return {
+      tools: undefined,
+      toolChoice: 'auto',
+      onData: optionsOrOnData,
+      onEnd,
+      onError,
+    }
+  }
+
+  const options = optionsOrOnData || {}
+  return {
+    tools: options.tools,
+    toolChoice: options.toolChoice ?? options.tool_choice ?? 'auto',
+    onData: options.onData,
+    onEnd: options.onEnd,
+    onError: options.onError,
+  }
 }
 
 /**
@@ -83,14 +117,30 @@ function assertAllowedHost(host) {
  *
  * @param {string} model    - model identifier
  * @param {Array}  messages - OpenAI-format message array
+ * @param {object} options - optional tool-call request options
  * @returns {{ frame: Buffer, prompt: string }}
  */
-function buildChatPayload(model, messages) {
-  const lastUserMsg = messages.filter(m => m.role === 'user').pop()
-  const prompt = extractContentText(lastUserMsg?.content)
-  const context = messages.map(m => `${m.role}: ${extractContentText(m.content)}`).join('\n')
+function buildChatPayload(model, messages, options = {}) {
+  const { tools, toolChoice = 'auto' } = options
+  const prompt = getPromptText(messages)
+  const baseContext = messages.map(m => `${m.role}: ${extractContentText(m.content)}`).join('\n')
+  const imageParts = messages.flatMap(message => extractImageParts(message.content))
+  const imageContexts = buildImageContexts(imageParts)
 
-  const { payload } = buildProtobufRequest(prompt, model, context)
+  const toolContext = buildToolResultContext(messages)
+  const toolPrompt = buildToolSystemPrompt(tools, toolChoice)
+
+  const contextParts = [baseContext]
+  if (toolContext.length > 0) {
+    contextParts.push(`Tool history:\n${toolContext}`)
+  }
+  if (toolPrompt.length > 0) {
+    contextParts.push(toolPrompt)
+  }
+
+  const context = contextParts.join('\n\n')
+
+  const { payload } = buildProtobufRequest(prompt, model, context, imageContexts)
   return { frame: createFrame(payload), prompt }
 }
 
@@ -103,12 +153,17 @@ function buildChatPayload(model, messages) {
  * @param {Function} opts.onEnd    - called when stream completes
  * @param {Function} opts.onError  - called on any error
  * @param {Object}   opts.client   - HTTP/2 client session
- * @returns {{ settle: Function, settleWithError: Function, setTimers: Function }}
+ * @returns {{ settle: Function, settleWithError: Function, setTimers: Function, emitData: Function }}
  */
 function createStreamSettler({ onData, onEnd, onError, client }) {
   let settled = false
   let idleCheckRef = null
   let hardTimerRef = null
+
+  const emitData = (text) => {
+    if (settled || !text) return
+    onData(text)
+  }
 
   const settle = (text) => {
     if (settled) return
@@ -134,19 +189,23 @@ function createStreamSettler({ onData, onEnd, onError, client }) {
     hardTimerRef = hardTimer
   }
 
-  return { settle, settleWithError, setTimers }
+  return { settle, settleWithError, setTimers, emitData }
 }
 
 /**
  * Wire up HTTP/2 stream events: response status check, data accumulation
  * with size limit, idle detection, hard timeout, and end/error handling.
  */
-function wireStreamEvents(h2Stream, { settle, settleWithError, setTimers }, prompt) {
-  const chunks = []
+function wireStreamEvents(h2Stream, { settle, settleWithError, setTimers, emitData }, prompt) {
+  const textExtractor = new StreamTextExtractor(prompt)
   let totalResponseSize = 0
   let lastDataTime = Date.now()
+  let receivedAnyData = false
 
-  const getResponseData = () => Buffer.concat(chunks)
+  const settleFromBufferedState = () => {
+    const trailingDelta = textExtractor.flush()
+    settle(trailingDelta)
+  }
 
   h2Stream.on('response', (headers) => {
     const status = headers[':status']
@@ -156,6 +215,7 @@ function wireStreamEvents(h2Stream, { settle, settleWithError, setTimers }, prom
   })
 
   h2Stream.on('data', (chunk) => {
+    receivedAnyData = true
     lastDataTime = Date.now()
     totalResponseSize += chunk.length
     if (totalResponseSize > MAX_RESPONSE_SIZE_BYTES) {
@@ -163,12 +223,13 @@ function wireStreamEvents(h2Stream, { settle, settleWithError, setTimers }, prom
       settleWithError(new Error('Upstream response exceeded maximum size'))
       return
     }
-    chunks.push(chunk)
+
+    const delta = textExtractor.push(chunk)
+    emitData(delta)
   })
 
   h2Stream.on('end', () => {
-    const text = extractTextFromResponse(getResponseData(), prompt)
-    settle(text)
+    settleFromBufferedState()
   })
 
   h2Stream.on('error', (err) => {
@@ -177,18 +238,14 @@ function wireStreamEvents(h2Stream, { settle, settleWithError, setTimers }, prom
 
   // Idle detection — response is considered complete after no data for IDLE_TIMEOUT_MS
   const idleCheck = setInterval(() => {
-    if (Date.now() - lastDataTime > IDLE_TIMEOUT_MS && chunks.length > 0) {
-      const text = extractTextFromResponse(getResponseData(), prompt)
-      settle(text)
+    if (Date.now() - lastDataTime > IDLE_TIMEOUT_MS && receivedAnyData) {
+      settleFromBufferedState()
     }
   }, IDLE_CHECK_INTERVAL_MS)
 
   // Hard timeout — guarantee the request eventually completes
   const hardTimer = setTimeout(() => {
-    const text = chunks.length > 0
-      ? extractTextFromResponse(getResponseData(), prompt)
-      : ''
-    settle(text)
+    settleFromBufferedState()
   }, HARD_TIMEOUT_MS)
 
   setTimers(idleCheck, hardTimer)
@@ -207,20 +264,37 @@ function wireStreamEvents(h2Stream, { settle, settleWithError, setTimers }, prom
  * @param {Function} onEnd    - called when the stream completes
  * @param {Function} onError  - called on any error
  */
-export function streamChat(model, messages, onData, onEnd, onError) {
+export function streamChat(model, messages, optionsOrOnData, onEnd, onError) {
+  const {
+    tools,
+    toolChoice,
+    onData,
+    onEnd: onStreamEnd,
+    onError: onStreamError,
+  } = normalizeStreamChatOptions(optionsOrOnData, onEnd, onError)
+
+  if (typeof onData !== 'function' || typeof onStreamEnd !== 'function' || typeof onStreamError !== 'function') {
+    throw new Error('streamChat requires onData, onEnd, and onError callbacks')
+  }
+
   let token
   try {
     assertAllowedHost(AGENT_BASE)
     token = getToken()
   } catch (err) {
-    onError(err)
+    onStreamError(err)
     return
   }
 
-  const { frame, prompt } = buildChatPayload(model, messages)
+  const { frame, prompt } = buildChatPayload(model, messages, { tools, toolChoice })
   const client = http2.connect(`https://${AGENT_BASE}`)
 
-  const settler = createStreamSettler({ onData, onEnd, onError, client })
+  const settler = createStreamSettler({
+    onData,
+    onEnd: onStreamEnd,
+    onError: onStreamError,
+    client,
+  })
 
   client.on('error', (err) => {
     process.stderr.write(`  HTTP/2 client error: ${err.message}\n`)
@@ -253,6 +327,8 @@ function attachConnectRequestHandlers(req, {
   reject,
   isSettled,
   maxResponseSize,
+  getResponseStatus = () => 200,
+  getRetryAfterMs = () => null,
 }) {
   const responseChunks = []
   let responseSize = 0
@@ -272,6 +348,21 @@ function attachConnectRequestHandlers(req, {
   req.on('end', () => {
     if (isSettled()) return
     cleanup()
+
+    const statusCode = getResponseStatus()
+    if (statusCode >= 400) {
+      const error = new Error(`Cursor API returned HTTP ${statusCode}`)
+      error.statusCode = statusCode
+
+      const retryAfterMs = getRetryAfterMs()
+      if (Number.isFinite(retryAfterMs)) {
+        error.retryAfterMs = retryAfterMs
+      }
+
+      reject(error)
+      return
+    }
+
     try {
       const data = Buffer.concat(responseChunks).toString('utf8')
       resolve(JSON.parse(data))
@@ -302,9 +393,11 @@ export async function connectRequest(host, service, method, body = {}) {
   const token = getToken()
   const postData = JSON.stringify(body)
 
-  return new Promise((resolve, reject) => {
+  return withRetry(() => new Promise((resolve, reject) => {
     const client = http2.connect(`https://${host}`)
     let settled = false
+    let responseStatus = 200
+    let retryAfterMs = null
     const isSettled = () => settled
 
     const cleanup = () => {
@@ -332,21 +425,36 @@ export async function connectRequest(host, service, method, body = {}) {
       'accept': 'application/json',
     })
 
+    req.on('response', (headers) => {
+      responseStatus = Number(headers[':status'] || 200)
+      const retryAfterHeader = headers['retry-after']
+      const retryAfterValue = Array.isArray(retryAfterHeader)
+        ? retryAfterHeader[0]
+        : retryAfterHeader
+      retryAfterMs = parseRetryAfterHeader(
+        typeof retryAfterValue === 'number' ? String(retryAfterValue) : retryAfterValue
+      )
+    })
+
     attachConnectRequestHandlers(req, {
       cleanup,
       resolve,
       reject,
       isSettled,
       maxResponseSize: MAX_RESPONSE_SIZE_BYTES,
+      getResponseStatus: () => responseStatus,
+      getRetryAfterMs: () => retryAfterMs,
     })
 
     req.write(postData)
     req.end()
-  })
+  }))
 }
 
 export const __testables = Object.freeze({
   MAX_RESPONSE_SIZE_BYTES,
+  normalizeStreamChatOptions,
+  buildChatPayload,
   createStreamSettler,
   wireStreamEvents,
   attachConnectRequestHandlers,
