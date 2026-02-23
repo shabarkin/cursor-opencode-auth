@@ -39,6 +39,7 @@ const VALID_ROLES = Object.freeze(['system', 'user', 'assistant', 'tool'])
 class RequestError extends Error {
   constructor(statusCode, message) {
     super(message)
+    this.name = 'RequestError'
     this.statusCode = statusCode
   }
 }
@@ -128,6 +129,74 @@ function sanitizeContent(content) {
   return String(content)
 }
 
+/**
+ * Validate a single content part within a message content array.
+ *
+ * @param {*}      part   - the content part to validate
+ * @param {string} prefix - error message prefix (e.g. "messages[0].content[1]")
+ * @returns {string[]} array of validation error strings
+ */
+function validateContentPart(part, prefix) {
+  const errors = []
+
+  if (!part || typeof part !== 'object' || Array.isArray(part)) {
+    errors.push(`${prefix} must be an object`)
+    return errors
+  }
+
+  if (typeof part.type !== 'string' || part.type.length === 0) {
+    errors.push(`${prefix}.type must be a non-empty string`)
+  }
+
+  if (part.type === 'text' && typeof part.text !== 'string') {
+    errors.push(`${prefix}.text must be a string when type is "text"`)
+  } else if (part.text !== undefined && typeof part.text !== 'string') {
+    errors.push(`${prefix}.text must be a string when provided`)
+  }
+
+  return errors
+}
+
+/**
+ * Validate a single message object (role + content).
+ *
+ * @param {*}      msg    - the message to validate
+ * @param {number} index  - message index for error context
+ * @returns {string[]} array of validation error strings
+ */
+function validateMessage(msg, index) {
+  const prefix = `messages[${index}]`
+  const errors = []
+
+  if (!msg || typeof msg !== 'object') {
+    return [`${prefix} must be an object`]
+  }
+
+  if (!VALID_ROLES.includes(msg.role)) {
+    errors.push(`${prefix}.role must be one of: ${VALID_ROLES.join(', ')}`)
+  }
+
+  if (msg.content === undefined || msg.content === null) {
+    errors.push(`${prefix}.content is required`)
+  } else if (typeof msg.content !== 'string' && !Array.isArray(msg.content)) {
+    errors.push(`${prefix}.content must be a string or array`)
+  } else if (Array.isArray(msg.content)) {
+    for (let j = 0; j < msg.content.length; j++) {
+      errors.push(...validateContentPart(msg.content[j], `${prefix}.content[${j}]`))
+    }
+  }
+
+  return errors
+}
+
+/**
+ * Validate and sanitize a chat completion request body.
+ * Returns a new sanitized object — only expected fields, no raw passthrough.
+ *
+ * @param {object} json - parsed request body
+ * @returns {{ model: string, messages: Array, stream: boolean }}
+ * @throws {RequestError} on validation failure
+ */
 function validateChatRequest(json) {
   const errors = []
 
@@ -143,37 +212,7 @@ function validateChatRequest(json) {
     errors.push('messages must not be empty')
   } else {
     for (let i = 0; i < json.messages.length; i++) {
-      const msg = json.messages[i]
-      if (!msg || typeof msg !== 'object') {
-        errors.push(`messages[${i}] must be an object`)
-        continue
-      }
-      if (!VALID_ROLES.includes(msg.role)) {
-        errors.push(`messages[${i}].role must be one of: ${VALID_ROLES.join(', ')}`)
-      }
-      if (msg.content === undefined || msg.content === null) {
-        errors.push(`messages[${i}].content is required`)
-      } else if (typeof msg.content !== 'string' && !Array.isArray(msg.content)) {
-        errors.push(`messages[${i}].content must be a string or array`)
-      } else if (Array.isArray(msg.content)) {
-        for (let j = 0; j < msg.content.length; j++) {
-          const part = msg.content[j]
-          if (!part || typeof part !== 'object' || Array.isArray(part)) {
-            errors.push(`messages[${i}].content[${j}] must be an object`)
-            continue
-          }
-
-          if (typeof part.type !== 'string' || part.type.length === 0) {
-            errors.push(`messages[${i}].content[${j}].type must be a non-empty string`)
-          }
-
-          if (part.type === 'text' && typeof part.text !== 'string') {
-            errors.push(`messages[${i}].content[${j}].text must be a string when type is "text"`)
-          } else if (part.text !== undefined && typeof part.text !== 'string') {
-            errors.push(`messages[${i}].content[${j}].text must be a string when provided`)
-          }
-        }
-      }
+      errors.push(...validateMessage(json.messages[i], i))
     }
   }
 
@@ -185,7 +224,6 @@ function validateChatRequest(json) {
     throw new RequestError(400, `Invalid request: ${errors.join('; ')}`)
   }
 
-  // Return sanitized object — only expected fields, no raw passthrough
   return {
     model: typeof json.model === 'string' ? json.model : 'composer-1',
     messages: json.messages.map(msg => ({
@@ -284,24 +322,26 @@ function handleChatStream(res, model, messages) {
     },
     (err) => {
       process.stderr.write(`Stream error: ${err.message}\n`)
-      res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`)
+      res.write(`data: ${JSON.stringify({ error: 'Internal proxy error' })}\n\n`)
       res.end()
     }
   )
 }
 
 async function handleChatNonStream(res, model, messages) {
-  let fullResponse = ''
+  const chunks = []
 
   await new Promise((resolve, reject) => {
     streamChat(
       model,
       messages,
-      (text) => { fullResponse += text },
+      (text) => { chunks.push(text) },
       resolve,
       reject
     )
   })
+
+  const fullResponse = chunks.join('')
 
   jsonResponse(res, 200, {
     id: `chatcmpl-${randomUUID()}`,

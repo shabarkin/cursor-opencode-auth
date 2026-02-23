@@ -96,7 +96,7 @@ function isFilteredOut(text, textLower, userPromptLower) {
 
   // Exact user prompt echo
   if (textLower === userPromptLower) return true
-  if (userPromptLower && text.includes(userPromptLower)) return true
+  if (userPromptLower && textLower.includes(userPromptLower)) return true
 
   // Hex IDs
   if (HEX16_RE.test(text)) return true
@@ -207,10 +207,12 @@ export function extractTextFromResponse(data, userPrompt = '') {
     .sort((a, b) => b.score - a.score)
 
   if (process.env.DEBUG) {
+    const sanitize = (s) => s.replace(/[^\x20-\x7e]/g, '')
     process.stderr.write('Top 5 candidates:\n')
     candidates.slice(0, 5).forEach((c, i) => {
+      const preview = sanitize(c.text.substring(0, 60))
       process.stderr.write(
-        `  ${i + 1}. score=${c.score} frame=${c.frameIndex} depth=${c.depth}: "${c.text.substring(0, 60)}..."\n`
+        `  ${i + 1}. score=${c.score} frame=${c.frameIndex} depth=${c.depth}: "${preview}..."\n`
       )
     })
   }

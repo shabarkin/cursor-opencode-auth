@@ -75,7 +75,127 @@ function assertAllowedHost(host) {
 }
 
 // ---------------------------------------------------------------------------
-// Streaming protobuf chat
+// Streaming protobuf chat — helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Build the protobuf frame for a chat request from OpenAI-format messages.
+ *
+ * @param {string} model    - model identifier
+ * @param {Array}  messages - OpenAI-format message array
+ * @returns {{ frame: Buffer, prompt: string }}
+ */
+function buildChatPayload(model, messages) {
+  const lastUserMsg = messages.filter(m => m.role === 'user').pop()
+  const prompt = extractContentText(lastUserMsg?.content)
+  const context = messages.map(m => `${m.role}: ${extractContentText(m.content)}`).join('\n')
+
+  const { payload } = buildProtobufRequest(prompt, model, context)
+  return { frame: createFrame(payload), prompt }
+}
+
+/**
+ * Create settle/settleWithError closures that ensure single-fire semantics,
+ * timer cleanup, and client teardown.
+ *
+ * @param {Object} opts
+ * @param {Function} opts.onData   - called with extracted text on success
+ * @param {Function} opts.onEnd    - called when stream completes
+ * @param {Function} opts.onError  - called on any error
+ * @param {Object}   opts.client   - HTTP/2 client session
+ * @returns {{ settle: Function, settleWithError: Function, setTimers: Function }}
+ */
+function createStreamSettler({ onData, onEnd, onError, client }) {
+  let settled = false
+  let idleCheckRef = null
+  let hardTimerRef = null
+
+  const settle = (text) => {
+    if (settled) return
+    settled = true
+    clearInterval(idleCheckRef)
+    clearTimeout(hardTimerRef)
+    if (text) onData(text)
+    onEnd()
+    client.close()
+  }
+
+  const settleWithError = (err) => {
+    if (settled) return
+    settled = true
+    clearInterval(idleCheckRef)
+    clearTimeout(hardTimerRef)
+    onError(err)
+    client.close()
+  }
+
+  const setTimers = (idleCheck, hardTimer) => {
+    idleCheckRef = idleCheck
+    hardTimerRef = hardTimer
+  }
+
+  return { settle, settleWithError, setTimers }
+}
+
+/**
+ * Wire up HTTP/2 stream events: response status check, data accumulation
+ * with size limit, idle detection, hard timeout, and end/error handling.
+ */
+function wireStreamEvents(h2Stream, { settle, settleWithError, setTimers }, prompt) {
+  const chunks = []
+  let totalResponseSize = 0
+  let lastDataTime = Date.now()
+
+  const getResponseData = () => Buffer.concat(chunks)
+
+  h2Stream.on('response', (headers) => {
+    const status = headers[':status']
+    if (status !== 200) {
+      settleWithError(new Error(`Cursor API returned HTTP ${status}`))
+    }
+  })
+
+  h2Stream.on('data', (chunk) => {
+    lastDataTime = Date.now()
+    totalResponseSize += chunk.length
+    if (totalResponseSize > MAX_RESPONSE_SIZE_BYTES) {
+      h2Stream.destroy()
+      settleWithError(new Error('Upstream response exceeded maximum size'))
+      return
+    }
+    chunks.push(chunk)
+  })
+
+  h2Stream.on('end', () => {
+    const text = extractTextFromResponse(getResponseData(), prompt)
+    settle(text)
+  })
+
+  h2Stream.on('error', (err) => {
+    settleWithError(err)
+  })
+
+  // Idle detection — response is considered complete after no data for IDLE_TIMEOUT_MS
+  const idleCheck = setInterval(() => {
+    if (Date.now() - lastDataTime > IDLE_TIMEOUT_MS && chunks.length > 0) {
+      const text = extractTextFromResponse(getResponseData(), prompt)
+      settle(text)
+    }
+  }, IDLE_CHECK_INTERVAL_MS)
+
+  // Hard timeout — guarantee the request eventually completes
+  const hardTimer = setTimeout(() => {
+    const text = chunks.length > 0
+      ? extractTextFromResponse(getResponseData(), prompt)
+      : ''
+    settle(text)
+  }, HARD_TIMEOUT_MS)
+
+  setTimers(idleCheck, hardTimer)
+}
+
+// ---------------------------------------------------------------------------
+// Streaming protobuf chat — public API
 // ---------------------------------------------------------------------------
 
 /**
@@ -88,105 +208,35 @@ function assertAllowedHost(host) {
  * @param {Function} onError  - called on any error
  */
 export function streamChat(model, messages, onData, onEnd, onError) {
+  let token
   try {
     assertAllowedHost(AGENT_BASE)
+    token = getToken()
   } catch (err) {
     onError(err)
     return
   }
 
-  const token = getToken()
-
-  const lastUserMsg = messages.filter(m => m.role === 'user').pop()
-  const prompt = extractContentText(lastUserMsg?.content)
-  const context = messages.map(m => `${m.role}: ${extractContentText(m.content)}`).join('\n')
-
-  const { payload } = buildProtobufRequest(prompt, model, context)
-  const frame = createFrame(payload)
-
+  const { frame, prompt } = buildChatPayload(model, messages)
   const client = http2.connect(`https://${AGENT_BASE}`)
 
-  const chunks = []
-  let totalResponseSize = 0
-  let lastDataTime = Date.now()
-  let settled = false
-
-  const getResponseData = () => Buffer.concat(chunks)
-
-  const settle = (text) => {
-    if (settled) return
-    settled = true
-    clearInterval(idleCheck)
-    clearTimeout(hardTimer)
-    if (text) onData(text)
-    onEnd()
-    client.close()
-  }
-
-  const settleWithError = (err) => {
-    if (settled) return
-    settled = true
-    clearInterval(idleCheck)
-    clearTimeout(hardTimer)
-    onError(err)
-    client.close()
-  }
+  const settler = createStreamSettler({ onData, onEnd, onError, client })
 
   client.on('error', (err) => {
     process.stderr.write(`  HTTP/2 client error: ${err.message}\n`)
-    settleWithError(err)
+    settler.settleWithError(err)
   })
 
-  const stream = client.request({
+  const h2Stream = client.request({
     ':method': 'POST',
     ':path': '/agent.v1.AgentService/Run',
     ...buildHeaders(token),
   })
 
-  // Idle detection — response is considered complete after no data for IDLE_TIMEOUT_MS
-  const idleCheck = setInterval(() => {
-    if (Date.now() - lastDataTime > IDLE_TIMEOUT_MS && chunks.length > 0) {
-      const text = extractTextFromResponse(getResponseData(), prompt)
-      settle(text)
-    }
-  }, IDLE_CHECK_INTERVAL_MS)
+  wireStreamEvents(h2Stream, settler, prompt)
 
-  stream.on('response', (headers) => {
-    const status = headers[':status']
-    if (status !== 200) {
-      settleWithError(new Error(`Cursor API returned HTTP ${status}`))
-    }
-  })
-
-  stream.on('data', (chunk) => {
-    lastDataTime = Date.now()
-    totalResponseSize += chunk.length
-    if (totalResponseSize > MAX_RESPONSE_SIZE_BYTES) {
-      settleWithError(new Error('Upstream response exceeded maximum size'))
-      return
-    }
-    chunks.push(chunk)
-  })
-
-  stream.on('end', () => {
-    const text = extractTextFromResponse(getResponseData(), prompt)
-    settle(text)
-  })
-
-  stream.on('error', (err) => {
-    settleWithError(err)
-  })
-
-  stream.write(frame)
-  stream.end()
-
-  // Hard timeout — guarantee the request eventually completes
-  const hardTimer = setTimeout(() => {
-    const text = chunks.length > 0
-      ? extractTextFromResponse(getResponseData(), prompt)
-      : ''
-    settle(text)
-  }, HARD_TIMEOUT_MS)
+  h2Stream.write(frame)
+  h2Stream.end()
 }
 
 // ---------------------------------------------------------------------------
@@ -236,12 +286,26 @@ export async function connectRequest(host, service, method, body = {}) {
       'accept': 'application/json',
     })
 
-    let data = ''
-    req.on('data', (chunk) => { data += chunk })
+    const responseChunks = []
+    let responseSize = 0
+
+    req.on('data', (chunk) => {
+      if (settled) return
+      responseSize += chunk.length
+      if (responseSize > MAX_RESPONSE_SIZE_BYTES) {
+        req.destroy()
+        cleanup()
+        reject(new Error(`Response exceeded maximum size of ${MAX_RESPONSE_SIZE_BYTES} bytes`))
+        return
+      }
+      responseChunks.push(chunk)
+    })
 
     req.on('end', () => {
+      if (settled) return
       cleanup()
       try {
+        const data = Buffer.concat(responseChunks).toString('utf8')
         resolve(JSON.parse(data))
       } catch {
         reject(new Error('Failed to parse Cursor API response'))
@@ -249,6 +313,7 @@ export async function connectRequest(host, service, method, body = {}) {
     })
 
     req.on('error', (err) => {
+      if (settled) return
       cleanup()
       reject(err)
     })
